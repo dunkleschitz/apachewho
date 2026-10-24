@@ -1,0 +1,1150 @@
+#!/usr/bin/env python3
+"""apachewho - which VirtualHost handles Host X, and which file:line set
+each effective directive for it.
+
+A static model of Apache httpd 2.4's documented rules (DESIGN-apachewho.md,
+BUILD APPROVED 2026-10-24). Claims are tagged [documented] or
+[docs-inferred]; no httpd is installed on this box, so no claim here is
+[observed] and live-agreement tests are skip-guarded.
+
+Selection (AP01) [documented]: match IP:port first (the query port comes
+from --port; a port on the Host header is ignored, as httpd ignores it),
+then first ServerName/ServerAlias match in configuration order -- there
+is NO precedence difference between wildcards and exact names, nor
+between ServerName and ServerAlias -- else the first vhost for that
+IP:port as default fallback. A sole vhost for the port serves without
+name matching. Names from the <VirtualHost> argument itself count as
+non-wildcard aliases [documented].
+
+Includes (AP02) [documented]: Include splices in place, wildcards expand
+alphabetically, a directory argument reads its files (and subdirectories)
+alphabetically, relative paths resolve against ServerRoot, missing
+Include is fatal while missing IncludeOptional is silent, cycles are
+fatal, symlinks are followed (Debian sites-enabled model).
+
+Merge (AP03) [documented]: for a directive, the chain is main-server
+value, then the selected vhost's value, then matching sections in
+group order -- Directory (shortest path first, regardless of file
+order), DirectoryMatch, Files/FilesMatch, Location/LocationMatch, If --
+server-context sections before vhost-context sections within a group.
+Per-directive merge semantics are module-defined: only the documented
+replace-class gets a plain "winner"; all other directives report the
+last merge step with a per-module-semantics caveat.
+
+Honesty limits: .htaccess is never read (AP04); conditionals are gated,
+never silently evaluated (AP05); <If> expressions are never evaluated;
+rewrite, proxy, auth verdicts and SSL certificate matching are never
+claimed (AP07). The tool never runs httpd, never writes, never touches
+the network, and opens config files read-only.
+
+Exit codes: 0 a vhost was selected (default fallback included, labeled);
+1 no vhost for the port, or the queried directive is unset everywhere;
+2 usage error, unreadable/missing config, fatal include error, or a
+malformed <VirtualHost>/section.
+
+Findings: AP02 include problems (fatal/note/escape) | AP09 duplicate
+ServerName/alias shadowing | AP10 present-but-not-loaded (Debian
+sites-available) | AP11 vhost on an unlisted port | AP12 vhost with no
+ServerName | gated/inactive conditional sections.
+"""
+
+import argparse
+import fnmatch
+import glob
+import json
+import os
+import re
+import sys
+
+VERSION = "1.0.0"
+
+BANNER = ("static model of httpd 2.4 documented rules "
+          "([documented]/[docs-inferred]); not a live httpd verdict -- "
+          "see DESIGN-apachewho.md.")
+
+# Directives whose later merge step plainly replaces the earlier value
+# (plain scalar directives; AP03 replace-class). Everything else reports
+# its last merge step with a per-module-semantics caveat.
+REPLACE_CLASS = {
+    "DOCUMENTROOT", "SERVERNAME", "SERVERADMIN", "ERRORLOG",
+    "CUSTOMLOG", "LOGLEVEL", "TIMEOUT", "KEEPTIMEOUT",
+    "MAXKEEPALIVEREQUESTS", "ALLOWOVERRIDE", "SERVERTOKENS",
+    "SERVERSIGNATURE", "HOSTNAMELOOKUPS", "USECANONICALNAME",
+    "USECANONICALPHYSICALPORT", "SERVERPATH", "DOCUMENTROOT",
+}
+
+CONDITIONAL_KINDS = {"IFMODULE", "IFDEFINE", "IF", "IFVERSION", "IFFILE"}
+SECTION_GROUP = {
+    "DIRECTORY": 0, "DIRECTORYMATCH": 1,
+    "FILES": 2, "FILESMATCH": 2,
+    "LOCATION": 3, "LOCATIONMATCH": 3,
+    "IF": 4, "IFMODULE": 4, "IFDEFINE": 4, "IFVERSION": 4, "IFFILE": 4,
+}
+
+
+# ---------------------------------------------------------------------------
+# Lexing: Apache config lines (comments, quotes, continuations)
+# ---------------------------------------------------------------------------
+
+def split_line(line):
+    """Split one logical line into tokens, respecting quotes; '#' outside
+    quotes starts a comment. Quotes are stripped from tokens."""
+    toks = []
+    cur = []
+    q = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if q:
+            if c == "\\" and i + 1 < len(line):
+                cur.append(line[i + 1])
+                i += 2
+                continue
+            if c == q:
+                q = None
+            else:
+                cur.append(c)
+        elif c in "\"'":
+            q = c
+        elif c == "#":
+            break
+        elif c.isspace():
+            if cur:
+                toks.append("".join(cur))
+                cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if cur:
+        toks.append("".join(cur))
+    return toks, q is not None
+
+
+def logical_lines(text):
+    """Join backslash-continued lines; yield (text, start_line)."""
+    out = []
+    buf = ""
+    start = 0
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip("\n")
+        if buf:
+            buf += line
+        else:
+            buf = line
+            start = n
+        if buf.endswith("\\") and not buf.endswith("\\\\"):
+            buf = buf[:-1]
+            continue
+        out.append((buf, start))
+        buf = ""
+    if buf:
+        out.append((buf, start))
+    return out
+
+
+class Directive:
+    __slots__ = ("name", "args", "path", "line", "seq")
+
+    def __init__(self, name, args, path, line, seq):
+        self.name = name
+        self.args = args
+        self.path = path
+        self.line = line
+        self.seq = seq
+
+    def ref(self):
+        return "%s:%d" % (self.path, self.line)
+
+
+class Section:
+    __slots__ = ("name", "args", "path", "line", "seq", "children")
+
+    def __init__(self, name, args, path, line, seq):
+        self.name = name
+        self.args = args
+        self.path = path
+        self.line = line
+        self.seq = seq
+        self.children = []
+
+    def ref(self):
+        return "%s:%d" % (self.path, self.line)
+
+
+class Ctx:
+    def __init__(self, entry, root, conf_dir):
+        self.entry = entry
+        self.root = root  # fixture root for symlink-escape checks (or None)
+        self.conf_dir = conf_dir
+        self.server_root = root or conf_dir
+        self.stack = []  # realpaths on the include stack
+        self.loaded = []  # realpaths of files actually parsed
+        self.seq = 0
+        self.errors = []  # fatal findings (exit 2)
+        self.findings = []  # non-fatal findings
+        self.prescan_server_root(entry)
+
+    def prescan_server_root(self, entry):
+        try:
+            with open(entry, "r") as fh:
+                text = fh.read()
+        except OSError:
+            return
+        for line, _ in logical_lines(text):
+            toks, _ = split_line(line)
+            if len(toks) >= 2 and toks[0].lower() == "serverroot":
+                val = toks[1]
+                self.server_root = val if os.path.isabs(val) else \
+                    os.path.normpath(os.path.join(self.conf_dir, val))
+                break
+
+    def next_seq(self):
+        self.seq += 1
+        return self.seq
+
+    def finding(self, code, severity, message):
+        self.findings.append({"code": code, "severity": severity,
+                              "message": message})
+
+
+# ---------------------------------------------------------------------------
+# Parser with in-place Include expansion
+# ---------------------------------------------------------------------------
+
+def expand_include(pattern, optional, including_file, ctx, sink):
+    """Expand one Include/IncludeOptional into sink (in place)."""
+    if os.path.isabs(pattern):
+        base = pattern
+    else:
+        base = os.path.normpath(os.path.join(ctx.server_root, pattern))
+    targets = []
+    if os.path.isdir(base):
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames.sort()
+            for fn in sorted(filenames):
+                targets.append(os.path.join(dirpath, fn))
+    elif glob.has_magic(base):
+        targets = sorted(glob.glob(base))
+    elif os.path.exists(base):
+        targets = [base]
+    if not targets:
+        if optional:
+            ctx.finding("AP02", "note",
+                        "missing IncludeOptional target (silent, "
+                        "[documented]): %s (included from %s)"
+                        % (pattern, including_file))
+        else:
+            ctx.errors.append(
+                "missing Include target (fatal, [documented]): %s "
+                "(included from %s)" % (pattern, including_file))
+        return
+    for target in targets:
+        real = os.path.realpath(target)
+        if ctx.root:
+            root_real = os.path.realpath(ctx.root)
+            if os.path.commonpath([real, root_real]) != root_real:
+                ctx.finding(
+                    "AP02", "warning",
+                    "include escapes fixture root, not followed: %s "
+                    "(target %s)" % (pattern, target))
+                continue
+        if real in ctx.stack:
+            ctx.errors.append(
+                "include cycle (fatal, [documented]): %s already on "
+                "the include stack (included from %s)"
+                % (target, including_file))
+            continue
+        parse_file(target, ctx, sink)
+
+
+def parse_file(path, ctx, sink):
+    try:
+        with open(path, "r") as fh:
+            text = fh.read()
+    except OSError as exc:
+        ctx.errors.append("cannot read config file %s: %s" % (path, exc))
+        return
+    ctx.loaded.append(os.path.realpath(path))
+    ctx.stack.append(os.path.realpath(path))
+    try:
+        parse_tree(text, path, ctx, sink)
+    finally:
+        ctx.stack.pop()
+
+
+# The recursive parser above cannot be expressed as a flat loop without
+# an index-based walker, so the real implementation follows: it walks
+# logical lines with an explicit index and recurses into sections.
+def parse_tag(line):
+    """Parse a section tag line. Returns (kind, name, args) where kind
+    is 'open' or 'close', or None if the line is not a tag line. A tag
+    line starts with '<' and its closing '>' is the first '>' outside
+    quotes (so quoted '>' inside an argument does not end the tag)."""
+    s = line.strip()
+    if not s.startswith("<"):
+        return None
+    q = None
+    j = None
+    for i, c in enumerate(s):
+        if q:
+            if c == q:
+                q = None
+        elif c in "\"'":
+            q = c
+        elif c == ">":
+            j = i
+            break
+    if j is None:
+        return None
+    inner = s[1:j].strip()
+    if inner.startswith("/"):
+        parts = inner[1:].strip().split()
+        return ("close", parts[0].upper() if parts else "", [])
+    parts = split_line(inner)[0]
+    if not parts:
+        return None
+    return ("open", parts[0].upper(), parts[1:])
+
+
+def parse_tree(text, path, ctx, sink):
+    lines = logical_lines(text)
+    idx = 0
+
+    def walk(sink, open_section):
+        nonlocal idx
+        while idx < len(lines):
+            line, lineno = lines[idx]
+            idx += 1
+            toks, unterminated = split_line(line)
+            if unterminated:
+                ctx.errors.append("%s:%d: unterminated quote"
+                                  % (path, lineno))
+                continue
+            if not toks:
+                continue
+            first = toks[0]
+            tag = parse_tag(line)
+            if line.strip().startswith("<") and tag is None:
+                ctx.errors.append("%s:%d: malformed section tag"
+                                  % (path, lineno))
+                continue
+            if tag is not None:
+                kind, name, targs = tag
+                if kind == "close":
+                    if open_section is None:
+                        ctx.errors.append(
+                            "%s:%d: closing </%s> with no open section"
+                            % (path, lineno, name))
+                    elif name != open_section.name:
+                        ctx.errors.append(
+                            "%s:%d: closing </%s> does not match open "
+                            "<%s> from %s"
+                            % (path, lineno, name, open_section.name,
+                               open_section.ref()))
+                    return
+                sec = Section(name, targs, path, lineno, ctx.next_seq())
+                sink.append(sec)
+                walk(sec.children, sec)
+                continue
+            name = first.upper()
+            args = toks[1:]
+            if name in ("INCLUDE", "INCLUDEOPTIONAL"):
+                if not args:
+                    ctx.errors.append("%s:%d: %s with no argument"
+                                      % (path, lineno, name))
+                    continue
+                for pat in args:
+                    expand_include(pat, name == "INCLUDEOPTIONAL",
+                                   path, ctx, sink)
+                continue
+            d = Directive(name, args, path, lineno, ctx.next_seq())
+            sink.append(d)
+            if name == "SERVERROOT" and args:
+                val = args[0]
+                ctx.server_root = val if os.path.isabs(val) else \
+                    os.path.normpath(os.path.join(ctx.conf_dir, val))
+        if open_section is not None:
+            ctx.errors.append(
+                "%s: section <%s> opened at %s is never closed"
+                % (path, open_section.name, open_section.ref()))
+
+    walk(sink, None)
+
+
+def parse_config(entry, root):
+    """Parse the whole tree. Returns (nodes, ctx, loaded_files)."""
+    conf_dir = os.path.dirname(os.path.abspath(entry))
+    ctx = Ctx(entry, root, conf_dir)
+    nodes = []
+    parse_file(entry, ctx, nodes)
+    return nodes, ctx, list(ctx.loaded)
+
+
+# ---------------------------------------------------------------------------
+# Model extraction
+# ---------------------------------------------------------------------------
+
+def all_directives(nodes):
+    for node in nodes:
+        if isinstance(node, Directive):
+            yield node
+        else:
+            yield from all_directives(node.children)
+
+
+def parse_listen(args):
+    """Return (addr, port) for a Listen directive; port may be None."""
+    if not args:
+        return None
+    spec = args[0]
+    if spec.startswith("["):
+        # [::1]:80
+        m = re.match(r"^\[([^\]]+)\](?::(\d+|\*))?$", spec)
+        if not m:
+            return None
+        return (m.group(1), int(m.group(2)) if m.group(2)
+                and m.group(2) != "*" else None)
+    if ":" in spec:
+        addr, port = spec.rsplit(":", 1)
+        if port == "*":
+            return (addr, None)
+        try:
+            return (addr, int(port))
+        except ValueError:
+            return None
+    try:
+        return ("*", int(spec))
+    except ValueError:
+        return None
+
+
+def parse_vhost_addr(token):
+    """Return (addr, port) or None if malformed (fatal, AP06)."""
+    if token in ("*", "_default_"):
+        return (token, None)
+    if token.startswith("["):
+        m = re.match(r"^\[([^\]]+)\](?::(\d+|\*))?$", token)
+        if not m:
+            return None
+        return (m.group(1), int(m.group(2)) if m.group(2)
+                and m.group(2) != "*" else None)
+    if ":" in token:
+        addr, port = token.rsplit(":", 1)
+        if port == "*":
+            return (addr, None)
+        try:
+            return (addr, int(port))
+        except ValueError:
+            return None
+    # Bare token: hostname or address, no port.
+    return (token, None)
+
+
+def is_ip_like(token):
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", token):
+        return True
+    if ":" in token:
+        return True
+    return False
+
+
+class VHost:
+    def __init__(self, section, gates):
+        self.section = section
+        self.gates = gates  # conditional sections wrapping the vhost
+        self.addrs = []     # [(addr, port, token)]
+        self.names = []     # [(name, kind, path, line)]
+        self.top = []       # flattened directive entries, scope=vhost
+        self.sections = []  # flattened section entries, scope=vhost
+
+
+class Entry:
+    """A directive occurrence with its section stack and gates."""
+    __slots__ = ("directive", "scope", "stack")
+
+    def __init__(self, directive, scope, stack):
+        self.directive = directive
+        self.scope = scope  # "main" or "vhost"
+        self.stack = stack  # list[Section], outermost first
+
+    def gates(self):
+        return [s for s in self.stack if s.name in CONDITIONAL_KINDS]
+
+    def sections(self):
+        return [s for s in self.stack if s.name not in CONDITIONAL_KINDS]
+
+    def group_rank(self):
+        secs = self.sections()
+        if not secs:
+            return -1
+        return SECTION_GROUP.get(secs[-1].name, 4)
+
+    def dir_key(self):
+        for s in reversed(self.sections()):
+            if s.name == "DIRECTORY":
+                return len(s.args[0]) if s.args else 0
+        return 0
+
+
+def flatten(nodes, scope, stack, out_entries, vhosts, outer_gates):
+    """Walk nodes; directives become entries; VirtualHost sections at
+    top level become VHosts; other sections extend the stack."""
+    for node in nodes:
+        if isinstance(node, Directive):
+            out_entries.append(Entry(node, scope, list(stack)))
+        elif node.name == "VIRTUALHOST" and scope == "main" \
+                and all(s.name in CONDITIONAL_KINDS for s in stack):
+            # Top-level vhost, optionally wrapped in conditional
+            # section(s): the conditionals become the vhost's gates.
+            vh = VHost(node, list(stack))
+            vhosts.append(vh)
+            flatten(node.children, "vhost", [], vh.top, [], [])
+            # sections inside the vhost are the vhost entries whose
+            # stack is non-empty; split top into plain vs sectioned:
+            vh.sections = [e for e in vh.top if e.stack]
+            vh.top = [e for e in vh.top if not e.stack]
+        elif node.name == "VIRTUALHOST":
+            # A vhost nested inside a non-conditional section is
+            # malformed for v1.
+            raise ValueError(
+                "%s: <VirtualHost> nested inside <%s> is not supported"
+                % (node.ref(), stack[-1].name if stack else "?"))
+        else:
+            flatten(node.children, scope, stack + [node], out_entries,
+                    vhosts, outer_gates)
+
+
+def build_model(nodes, ctx, cli_defines):
+    """Returns (vhosts, main_entries, loadmodules, defines, listens)."""
+    # Collect LoadModule / Define / Listen from the whole tree first so
+    # gate evaluation sees the complete in-tree state.
+    loaded_ids = set()
+    defines = set(cli_defines)
+    listens = []  # (addr, port)
+    for d in all_directives(nodes):
+        if d.name == "LOADMODULE" and len(d.args) >= 2:
+            mod = d.args[0]
+            loaded_ids.add(mod)
+            loaded_ids.add(mod + ".c" if not mod.endswith(".c") else mod)
+            base = os.path.basename(d.args[1])
+            base = re.sub(r"\.(so|la)$", "", base)
+            loaded_ids.add(base)
+            loaded_ids.add(base + ".c")
+        elif d.name == "DEFINE" and d.args:
+            defines.add(d.args[0])
+        elif d.name == "LISTEN":
+            parsed = parse_listen(d.args)
+            if parsed:
+                listens.append(parsed)
+
+    main_entries = []
+    vhosts = []
+    try:
+        flatten(nodes, "main", [], main_entries, vhosts, [])
+    except ValueError as exc:
+        ctx.errors.append(str(exc))
+
+    for vh in vhosts:
+        for token in vh.section.args:
+            parsed = parse_vhost_addr(token)
+            if parsed is None:
+                ctx.errors.append(
+                    "%s: malformed <VirtualHost> address %r (fatal, "
+                    "AP06)" % (vh.section.ref(), token))
+            else:
+                vh.addrs.append((parsed[0], parsed[1], token))
+        # Names: ServerName (first), ServerAlias (all), vhost-arg names.
+        server_name = None
+        for e in vh.top:
+            d = e.directive
+            if d.name == "SERVERNAME" and d.args and server_name is None:
+                server_name = d
+                vh.names.append((d.args[0], "exact", d.path, d.line))
+            elif d.name == "SERVERALIAS" and d.args:
+                for alias in d.args:
+                    vh.names.append((alias, "alias", d.path, d.line))
+        for addr, _port, token in vh.addrs:
+            if token not in ("*", "_default_") and not is_ip_like(token) \
+                    and not token.replace(".", "").replace("-", "").isdigit():
+                vh.names.append((token, "alias", vh.section.path,
+                                 vh.section.line))
+        vh.server_name = server_name
+    return vhosts, main_entries, loaded_ids, defines, listens
+
+
+def gate_status(section, loaded_ids, defines):
+    """Return 'applies', 'inactive', or 'unknown' for a conditional."""
+    kind = section.name
+    arg = section.args[0] if section.args else ""
+    if kind == "IFMODULE":
+        neg = arg.startswith("!")
+        name = arg[1:] if neg else arg
+        cands = {name, name[:-2] if name.endswith(".c") else name + ".c"}
+        known = bool(cands & loaded_ids)
+        if not loaded_ids:
+            return "unknown"
+        applies = known != neg
+        return "applies" if applies else "inactive"
+    if kind == "IFDEFINE":
+        # Design AP05: evaluable only with --define NAME (or a Define
+        # directive in-tree). Without that flag the section is
+        # [define-unknown] -- absence from a possibly-incomplete flag
+        # set is never treated as proof it is undefined.
+        neg = arg.startswith("!")
+        name = arg[1:] if neg else arg
+        if (name in defines) != neg:
+            return "applies"
+        return "unknown"
+    # <If>, <IfVersion>, <IfFile>: never evaluated (AP05).
+    return "unknown"
+
+
+def eval_gates(gates, loaded_ids, defines):
+    """Return (status, banner): 'applies', 'inactive', or 'unknown'."""
+    banners = []
+    for g in gates:
+        st = gate_status(g, loaded_ids, defines)
+        if st == "inactive":
+            return "inactive", []
+        if st == "unknown":
+            if g.name == "IFMODULE":
+                banners.append("[module-status-unknown]")
+            elif g.name == "IFDEFINE":
+                banners.append("[define-unknown]")
+            else:
+                banners.append("[expression-unmodeled]")
+    if banners:
+        return "unknown", banners
+    return "applies", []
+
+
+def section_applies(entry, path):
+    """Do the entry's non-conditional sections match the request path?"""
+    for s in entry.sections():
+        arg = s.args[0] if s.args else ""
+        if s.name == "DIRECTORY":
+            if not (path == arg or path.startswith(arg.rstrip("/") + "/")):
+                return False
+        elif s.name == "DIRECTORYMATCH":
+            try:
+                if not re.search(arg, path):
+                    return False
+            except re.error:
+                return False
+        elif s.name == "FILES":
+            if not fnmatch.fnmatchcase(os.path.basename(path), arg):
+                return False
+        elif s.name == "FILESMATCH":
+            try:
+                if not re.search(arg, os.path.basename(path)):
+                    return False
+            except re.error:
+                return False
+        elif s.name == "LOCATION":
+            if not (path == arg or path.startswith(arg.rstrip("/") + "/")
+                    or arg == "/"):
+                return False
+        elif s.name == "LOCATIONMATCH":
+            try:
+                if not re.search(arg, path):
+                    return False
+            except re.error:
+                return False
+    return True
+
+
+def name_matches(pattern, host):
+    """Case-insensitive fnmatch: * any run (incl. dots), ? one char."""
+    return fnmatch.fnmatchcase(host.lower(), pattern.lower())
+
+
+def strip_host_port(host):
+    if host.startswith("["):
+        m = re.match(r"^\[([^\]]+)\](?::\d+)?$", host)
+        return m.group(1) if m else host
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host
+
+
+# ---------------------------------------------------------------------------
+# Selection and merge chain
+# ---------------------------------------------------------------------------
+
+def selectable_ports(vh, listen_ports):
+    """Ports this vhost can actually serve (AP11)."""
+    ports = set()
+    for _addr, port, _tok in vh.addrs:
+        if port is None:
+            # No port in the vhost argument: treat as any port only
+            # when no Listen set exists to contradict it; otherwise it
+            # cannot be tied to a listed port.
+            if not listen_ports:
+                return None  # any port
+            continue
+        if not listen_ports or port in listen_ports:
+            ports.add(port)
+    return ports
+
+
+def candidates_for(vhosts, port, bind, listen_ports, ctx):
+    out = []
+    for vh in vhosts:
+        ports = selectable_ports(vh, listen_ports)
+        if ports is not None and port not in ports:
+            continue
+        if bind is not None:
+            ok = False
+            for addr, _p, _t in vh.addrs:
+                if addr in ("*", "_default_") or addr == bind:
+                    ok = True
+            if not ok:
+                continue
+        out.append(vh)
+    return out
+
+
+def select(vhosts, host, port, bind, listen_ports, ctx):
+    """Return (winner, considered) where considered is a list of dicts."""
+    cands = candidates_for(vhosts, port, bind, listen_ports, ctx)
+    if not cands:
+        return (None, None, None), []
+    considered = []
+    winner = None
+    winner_reason = None
+    winner_name = None
+    if len(cands) == 1:
+        winner = cands[0]
+        winner_reason = "sole-ip-match"
+    else:
+        for vh in cands:
+            match = None
+            for name, kind, _p, _l in vh.names:
+                if name_matches(name, host):
+                    match = (name, kind)
+                    break
+            considered.append((vh, match))
+            if match and winner is None:
+                winner = vh
+                winner_name = match
+                if match[1] == "exact":
+                    winner_reason = "exact ServerName match"
+                elif "*" in match[0] or "?" in match[0]:
+                    winner_reason = "wildcard match"
+                else:
+                    winner_reason = "alias match"
+        if winner is None:
+            winner = cands[0]
+            winner_reason = "default-fallback (first vhost for port)"
+    if len(cands) == 1:
+        considered = [(cands[0], None)]
+    out = []
+    for vh, match in considered:
+        if vh is winner:
+            lost = None
+        elif match is not None:
+            lost = "later in file order than the winner"
+        else:
+            lost = "name mismatch"
+        out.append({"vhost": vh, "match": match, "lost": lost})
+    return (winner, winner_reason, winner_name), out
+
+
+def build_chain(vh, main_entries, key, path, loaded_ids, defines, ctx):
+    """Merge chain for directive KEY. Returns (chain, gated, winner_idx).
+    chain: list of dicts in merge order; gated: entries held by unknown
+    conditionals, never counted; inactive sections become findings."""
+    wanted = key.upper()
+    pool = []
+    for e in main_entries:
+        if e.directive.name == wanted:
+            pool.append(e)
+    for e in vh.top + vh.sections:
+        if e.directive.name == wanted:
+            pool.append(e)
+    chain = []
+    gated = []
+    seen_inactive = set()
+    for e in pool:
+        gates = e.gates()
+        # Vhost-level gates (vhost wrapped in a conditional) apply to
+        # all its entries.
+        if e.scope == "vhost":
+            gates = gates + vh.gates
+        status, banners = eval_gates(gates, loaded_ids, defines)
+        if status == "inactive":
+            for g in gates:
+                if gate_status(g, loaded_ids, defines) == "inactive":
+                    ref = g.ref()
+                    if ref not in seen_inactive:
+                        seen_inactive.add(ref)
+                        ctx.finding(
+                            "AP05", "note",
+                            "conditional section <%s %s> at %s is "
+                            "inactive (not loaded/defined in-tree); "
+                            "its directives do not apply"
+                            % (g.name.lower(),
+                               " ".join(g.args), ref))
+            continue
+        if status == "unknown":
+            gated.append((e, banners))
+            continue
+        if e.stack and not section_applies(e, path):
+            continue
+        chain.append(e)
+
+    def sort_key(e):
+        scope_order = 0 if e.scope == "main" else 1
+        rank = e.group_rank()
+        is_section = 0 if rank == -1 else 1
+        # Directory: shortest path first, then file order.
+        return (scope_order, is_section, rank, e.dir_key(),
+                e.directive.seq)
+
+    chain.sort(key=sort_key)
+    return chain, gated
+
+
+def vhost_label(vh):
+    addrs = ",".join(tok for _a, _p, tok in vh.addrs) or "?"
+    return "%s (%s)" % (vh.section.ref(), addrs)
+
+
+def run(args):
+    if args.root and not args.conf:
+        cands = [os.path.join(args.root, n) for n in
+                 ("apache2.conf", "httpd.conf", "conf/httpd.conf")]
+        args.conf = next((c for c in cands if os.path.isfile(c)), None)
+        if args.conf is None:
+            print("apachewho: no apache2.conf/httpd.conf found under "
+                  "--root %s; pass --conf PATH" % args.root,
+                  file=sys.stderr)
+            return 2
+    if not args.conf:
+        for cand in ("/etc/apache2/apache2.conf",
+                     "/etc/httpd/conf/httpd.conf"):
+            if os.path.isfile(cand):
+                args.conf = cand
+                break
+    if not args.conf or not os.path.isfile(args.conf):
+        print("apachewho: config not found; pass --conf PATH "
+              "(looked for /etc/apache2/apache2.conf and "
+              "/etc/httpd/conf/httpd.conf)", file=sys.stderr)
+        return 2
+
+    root = args.root
+    nodes, ctx, loaded = parse_config(args.conf, root)
+    if ctx.errors:
+        for err in ctx.errors:
+            print("apachewho: error: %s" % err, file=sys.stderr)
+        return 2
+    loaded_real = set(loaded)
+    vhosts, main_entries, loaded_ids, defines, listens = build_model(
+        nodes, ctx, set(args.define or []))
+    if ctx.errors:
+        for err in ctx.errors:
+            print("apachewho: error: %s" % err, file=sys.stderr)
+        return 2
+    listen_ports = {p for _a, p in listens if p is not None}
+
+    # AP09 duplicate names (per port), AP11 unlisted ports, AP12 no
+    # ServerName, AP10 present-but-not-loaded.
+    by_port_name = {}
+    for vh in vhosts:
+        ports = selectable_ports(vh, listen_ports)
+        port_keys = ports if ports is not None else {"*"}
+        for name, _kind, _p, _l in vh.names:
+            for pk in port_keys:
+                by_port_name.setdefault((pk, name.lower()), []).append(vh)
+    for (pk, name), holders in sorted(by_port_name.items()):
+        if len(holders) > 1:
+            for later in holders[1:]:
+                ctx.finding(
+                    "AP09", "warning",
+                    "duplicate name %r for port %s: %s is shadowed by "
+                    "first match %s (first match wins, [documented])"
+                    % (name, pk, vhost_label(later),
+                       vhost_label(holders[0])))
+    for vh in vhosts:
+        if listen_ports:
+            for _addr, port, tok in vh.addrs:
+                if port is not None and port not in listen_ports:
+                    ctx.finding(
+                        "AP11", "warning",
+                        "vhost %s listens on unlisted port %s "
+                        "(no Listen for it in-tree); httpd warns and "
+                        "never serves it" % (vhost_label(vh), port))
+        if vh.server_name is None:
+            ctx.finding(
+                "AP12", "note",
+                "vhost %s has no ServerName; it can only serve as the "
+                "default fallback, never by name match"
+                % vhost_label(vh))
+    # AP10: Debian-style sites-available present but not loaded.
+    tree_root = root or os.path.dirname(os.path.abspath(args.conf))
+    avail = os.path.join(tree_root, "sites-available")
+    if os.path.isdir(avail):
+        for fn in sorted(os.listdir(avail)):
+            full = os.path.join(avail, fn)
+            if os.path.isfile(full) \
+                    and os.path.realpath(full) not in loaded_real:
+                ctx.finding(
+                    "AP10", "warning",
+                    "present but not loaded: %s has no enabled "
+                    "counterpart in the include expansion "
+                    "(sites-available without sites-enabled link)"
+                    % full)
+
+    if args.list_vhosts:
+        return report_list(vhosts, listen_ports, ctx, args)
+
+    host = strip_host_port(args.host)
+    port = args.port
+    (winner, reason, winner_name), considered = select(
+        vhosts, host, port, args.bind, listen_ports, ctx)
+    if winner is None:
+        if not args.quiet:
+            print("apachewho: no VirtualHost for port %d "
+                  "(no candidate matched IP:port)" % port)
+            print_findings(ctx)
+        return 1
+
+    chain = gated = None
+    winner_value = None
+    if args.directive:
+        chain, gated = build_chain(winner, main_entries, args.directive,
+                                   args.path, loaded_ids, defines, ctx)
+        if not chain:
+            if not args.quiet:
+                print("apachewho: directive %s is unset everywhere in "
+                      "the merge chain for %s" % (args.directive, host))
+                if gated:
+                    print("  gated (not counted):")
+                    for e, banners in gated:
+                        print("    %s = %s %s"
+                              % (e.directive.ref(),
+                                 " ".join(e.directive.args),
+                                 " ".join(banners)))
+                print_findings(ctx)
+            return 1
+        last = chain[-1].directive
+        winner_value = " ".join(last.args)
+
+    if args.json:
+        out = {
+            "host": host,
+            "port": port,
+            "path": args.path,
+            "model": BANNER,
+            "selected": {
+                "vhost": winner.section.ref(),
+                "addresses": [t for _a, _p, t in winner.addrs],
+                "names": [{"name": n, "kind": k, "ref": "%s:%d" % (p, l)}
+                          for n, k, p, l in winner.names],
+                "selection": reason,
+                "matched_name": winner_name[0] if winner_name else None,
+            },
+            "considered": [
+                {"vhost": c["vhost"].section.ref(),
+                 "matched": c["match"][0] if c["match"] else None,
+                 "lost_reason": c["lost"]}
+                for c in considered],
+            "findings": ctx.findings,
+        }
+        if args.directive:
+            out["directive"] = {
+                "name": args.directive,
+                "chain": [{"ref": e.directive.ref(),
+                           "value": " ".join(e.directive.args),
+                           "scope": e.scope,
+                           "group_rank": e.group_rank()}
+                          for e in chain],
+                "winner": {"ref": chain[-1].directive.ref(),
+                           "value": winner_value,
+                           "winner_kind":
+                               "winner by merge order"
+                               if args.directive.upper() in REPLACE_CLASS
+                               else "last merge step (merge semantics "
+                                    "per-module -- verify)"},
+                "gated": [{"ref": e.directive.ref(),
+                           "value": " ".join(e.directive.args),
+                           "banners": b}
+                          for e, b in gated],
+            }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    if args.quiet:
+        if args.directive:
+            print("%s %s" % (winner_value, chain[-1].directive.ref()))
+        else:
+            print("%s (%s)" % (winner.section.ref(), reason))
+        return 0
+
+    print(BANNER)
+    print("host %s port %d -> %s" % (host, port, vhost_label(winner)))
+    print("  selection: %s%s" % (
+        reason,
+        (" on %r" % winner_name[0]) if winner_name else ""))
+    if winner.names:
+        print("  names: %s" % ", ".join(
+            "%s (%s)" % (n, k) for n, k, _p, _l in winner.names))
+    if winner.gates:
+        print("  note: vhost is inside gated section(s): %s" %
+              ", ".join("%s at %s" % (g.name.lower(), g.ref())
+                        for g in winner.gates))
+    if considered:
+        print("  considered for this port:")
+        for c in considered:
+            if c["vhost"] is winner:
+                print("    * %s (selected)" % vhost_label(c["vhost"]))
+            else:
+                print("    - %s (%s)" % (vhost_label(c["vhost"]),
+                                          c["lost"]))
+    if args.directive:
+        print("  directive %s merge chain (AP03 order):" % args.directive)
+        for e in chain[:-1]:
+            print("    %s [%s] = %s (shadowed)"
+                  % (e.directive.ref(), e.scope,
+                     " ".join(e.directive.args)))
+        last = chain[-1]
+        if args.directive.upper() in REPLACE_CLASS:
+            print("    %s [%s] = %s (winner by merge order)"
+                  % (last.directive.ref(), last.scope,
+                     " ".join(last.directive.args)))
+        else:
+            print("    %s [%s] = %s (last merge step; merge semantics "
+                  "per-module -- verify)"
+                  % (last.directive.ref(), last.scope,
+                     " ".join(last.directive.args)))
+        if gated:
+            print("  gated directives (not counted):")
+            for e, banners in gated:
+                print("    %s = %s %s"
+                      % (e.directive.ref(), " ".join(e.directive.args),
+                         " ".join(banners)))
+        if args.directive.upper() in ("REWRITERULE", "REWRITECOND"):
+            print("  note [rewrite-unmodeled]: rewrite rules are listed "
+                  "with file:line only; no rewritten URL is claimed "
+                  "(AP07)")
+        if args.directive.upper() in ("PROXY", "PROXYMATCH", "PROXYPASS"):
+            print("  note [proxy-unmodeled]: proxy sections are listed "
+                  "with file:line only; no proxy target is claimed "
+                  "(AP07)")
+        if args.directive.upper() == "REQUIRE":
+            print("  note [auth-unmodeled]: Require chains are reported "
+                  "as a merge chain only; no grant verdict is claimed "
+                  "(AP07)")
+        # AP04: .htaccess gate note for directory-scoped queries.
+        allow = None
+        for e in chain:
+            if e.directive.name == "ALLOWOVERRIDE":
+                allow = " ".join(e.directive.args)
+        if allow and allow.lower() not in ("none",):
+            print("  note [htaccess-may-override]: effective "
+                  "AllowOverride is %s, so a .htaccess file could "
+                  "override directory-scoped directives (AP04); this "
+                  "answer is as far as the static config says" % allow)
+    else:
+        tops = [e for e in winner.top
+                if eval_gates(e.gates() + winner.gates, loaded_ids,
+                              defines)[0] == "applies"]
+        if tops:
+            print("  vhost top-level directives:")
+            for e in tops:
+                print("    %s:%d %s %s" % (e.directive.path,
+                                           e.directive.line,
+                                           e.directive.name,
+                                           " ".join(e.directive.args)))
+        print("  (use --directive KEY for the full AP03 merge chain)")
+    print_findings(ctx)
+    return 0
+
+
+def report_list(vhosts, listen_ports, ctx, args):
+    defaults = {}
+    for vh in vhosts:
+        ports = selectable_ports(vh, listen_ports)
+        keys = ports if ports is not None else {"*"}
+        for pk in keys:
+            defaults.setdefault(pk, vh)
+    if args.json:
+        print(json.dumps({
+            "model": BANNER,
+            "vhosts": [{
+                "vhost": vh.section.ref(),
+                "addresses": [t for _a, _p, t in vh.addrs],
+                "names": [{"name": n, "kind": k}
+                          for n, k, _p, _l in vh.names],
+                "default_for_ports": sorted(
+                    [pk for pk, d in defaults.items() if d is vh],
+                    key=str),
+            } for vh in vhosts],
+            "findings": ctx.findings,
+        }, indent=2))
+        return 0 if vhosts else 1
+    if not vhosts:
+        print("apachewho: no VirtualHosts found in the tree")
+        print_findings(ctx)
+        return 1
+    if not args.quiet:
+        print(BANNER)
+    for vh in vhosts:
+        marks = [pk for pk, d in defaults.items() if d is vh]
+        print("%s names=%s%s" % (
+            vhost_label(vh),
+            ",".join(n for n, _k, _p, _l in vh.names) or "(none)",
+            (" [default for port(s) %s]"
+             % ",".join(str(m) for m in sorted(marks, key=str)))
+            if marks else ""))
+    print_findings(ctx)
+    return 0
+
+
+def print_findings(ctx):
+    if ctx.findings:
+        print("findings:")
+        for f in ctx.findings:
+            print("  %s [%s] %s" % (f["code"], f["severity"],
+                                    f["message"]))
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="apachewho",
+        description="Which VirtualHost handles Host X, and which "
+                    "file:line set each effective directive for it "
+                    "(static model of httpd 2.4 documented rules).")
+    p.add_argument("host", nargs="?", help="Host header value to query")
+    p.add_argument("--port", type=int, default=80,
+                   help="connection port (default 80; a port on the "
+                        "Host header is ignored)")
+    p.add_argument("--bind", default=None,
+                   help="connection IP address to match against "
+                        "<VirtualHost> addresses (default: any)")
+    p.add_argument("--path", default="/",
+                   help="request path for section matching (default /)")
+    p.add_argument("--directive", default=None,
+                   help="directive to resolve through the AP03 merge "
+                        "chain (e.g. DocumentRoot)")
+    p.add_argument("--list-vhosts", action="store_true",
+                   help="list every vhost in configuration order")
+    p.add_argument("--conf", default=None, help="entry config file")
+    p.add_argument("--root", default=None,
+                   help="fixture tree root (ServerRoot + AP10 base; "
+                        "symlinks escaping it are not followed)")
+    p.add_argument("--define", action="append", default=[],
+                   help="define a name, mirroring httpd -D (repeatable)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--quiet", action="store_true",
+                   help="winner only")
+    p.add_argument("--version", action="version",
+                   version="apachewho %s" % VERSION)
+    args = p.parse_args(argv)
+    if not args.list_vhosts and not args.host:
+        p.error("HOST is required unless --list-vhosts is given")
+    return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
