@@ -106,5 +106,4 @@ $ apachewho www.example.com --directive DocumentRoot --path /app/x
 
 ## License
 
-MIT (pending Godsby's approval of the license for publication — not
-published).
+MIT — see LICENSE. Not published.
